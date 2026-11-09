@@ -1,0 +1,38 @@
+[package]
+name = "hyperion-ide"
+version = "0.1.0"
+edition = "2024"
+description = "HyperionIDE, a desktop IDE shell built on gpui-se"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "HyperionIDE"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { git = "https://github.com/futureboard/gpui-se", rev = "5779e7325fc499906eb7aa19c9156f9dcb96a9cc" }
+unicode-segmentation = "1.12.0"
+
+[patch.crates-io]
+# async-tar 0.5 (via gpui's http client) still depends on xattr 0.2.3,
+# which names libc::ENOATTR. Current libc removed that alias on Linux.
+xattr = { path = "vendor/xattr" }
+# gpui-se 5779e732 asks for accesskit 0.24 and accesskit_unix 0.17, but
+# 0.17.2 is built against accesskit 0.21. This tree is accesskit_unix 0.22
+# (accesskit 0.24) with its package version set to 0.17.2.
+accesskit_unix = { path = "vendor/accesskit_unix" }
+
+[patch."https://github.com/futureboard/gpui-se"]
+# Same revision as the git dependency. platform.rs is adjusted for ashpd 0.11,
+# which returns url::Url rather than the later ashpd::Uri type.
+gpui_linux = { path = "vendor/gpui_linux" }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_platform = { git = "https://github.com/futureboard/gpui-se", rev = "5779e7325fc499906eb7aa19c9156f9dcb96a9cc", features = ["wayland", "x11"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { git = "https://github.com/futureboard/gpui-se", rev = "5779e7325fc499906eb7aa19c9156f9dcb96a9cc", features = ["font-kit"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform = { git = "https://github.com/futureboard/gpui-se", rev = "5779e7325fc499906eb7aa19c9156f9dcb96a9cc" }
