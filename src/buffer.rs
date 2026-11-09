@@ -242,12 +242,12 @@ impl Buffer {
     }
 
     pub fn move_left(&mut self, select: bool) {
-        let next = prev_grapheme(&self.text, self.cursor());
+        let next = prev_grapheme(&self.text, self.snapped_cursor());
         self.move_to(next, select);
     }
 
     pub fn move_right(&mut self, select: bool) {
-        let next = next_grapheme(&self.text, self.cursor());
+        let next = next_grapheme(&self.text, self.snapped_cursor());
         self.move_to(next, select);
     }
 
@@ -267,12 +267,12 @@ impl Buffer {
     }
 
     pub fn move_line_start(&mut self, select: bool) {
-        let line = self.line_index(self.cursor());
+        let cursor = self.snapped_cursor();
+        let line = self.line_index(cursor);
         let start = self.line_start(line);
         let content = self.line_content(line);
         let indent_len = leading_indent(content).len();
         let indent = start + indent_len;
-        let cursor = self.cursor();
         let target = if cursor == indent { start } else { indent };
         self.move_to(target, select);
     }
@@ -292,12 +292,12 @@ impl Buffer {
     }
 
     pub fn move_word_left(&mut self, select: bool) {
-        let next = word_left(&self.text, self.cursor());
+        let next = word_left(&self.text, self.snapped_cursor());
         self.move_to(next, select);
     }
 
     pub fn move_word_right(&mut self, select: bool) {
-        let next = word_right(&self.text, self.cursor());
+        let next = word_right(&self.text, self.snapped_cursor());
         self.move_to(next, select);
     }
 
@@ -309,7 +309,7 @@ impl Buffer {
     }
 
     pub fn select_word_at(&mut self, offset: usize) {
-        let offset = self.clamp_offset(offset);
+        let offset = floor_grapheme(&self.text, self.clamp_offset(offset));
         let range = word_extent(&self.text, offset);
         self.coalesce = Coalesce::None;
         self.preferred_col = None;
@@ -332,7 +332,139 @@ impl Buffer {
     }
 
     pub fn set_cursor(&mut self, offset: usize, select: bool) {
-        self.move_to(self.clamp_offset(offset), select);
+        self.move_to(offset, select);
+    }
+
+    /// Select the next case-sensitive literal match at or after the caret.
+    /// Searches from the start once if nothing remains after the caret.
+    pub fn find_next(&mut self, needle: &str) -> bool {
+        let Some(range) = self.find_wrapping(needle, self.cursor()) else {
+            return false;
+        };
+        self.set_selection(range, false);
+        true
+    }
+
+    /// Byte range of the next literal match at or after `from`. Does not wrap.
+    pub fn find_literal(&self, needle: &str, from: usize) -> Option<Range<usize>> {
+        if needle.is_empty() {
+            return None;
+        }
+        let from = self.clamp_offset(from);
+        let index = self.text[from..].find(needle)?;
+        let start = from + index;
+        Some(start..start + needle.len())
+    }
+
+    /// Replace the current selection when it is `needle`, otherwise the next match.
+    pub fn replace_one(&mut self, needle: &str, replacement: &str) -> bool {
+        if needle.is_empty() {
+            return false;
+        }
+        let range = if self.selected_text() == needle {
+            self.selection.clone()
+        } else {
+            let Some(range) = self.find_wrapping(needle, self.cursor()) else {
+                return false;
+            };
+            range
+        };
+        self.splice(range, replacement, None);
+        true
+    }
+
+    /// Replace every non-overlapping literal match. Returns how many were replaced.
+    pub fn replace_all(&mut self, needle: &str, replacement: &str) -> usize {
+        if needle.is_empty() {
+            return 0;
+        }
+        let cursor = self.cursor();
+        let mut out = String::with_capacity(self.text.len());
+        let mut last = 0usize;
+        let mut count = 0usize;
+        let mut shift = 0isize;
+        let mut caret = cursor;
+        let mut caret_fixed = false;
+        while let Some(found) = self.text[last..].find(needle) {
+            let start = last + found;
+            let end = start + needle.len();
+            out.push_str(&self.text[last..start]);
+            out.push_str(replacement);
+            if !caret_fixed {
+                if cursor <= start {
+                    caret = shift_offset(cursor, shift);
+                    caret_fixed = true;
+                } else if cursor < end {
+                    caret = out.len();
+                    caret_fixed = true;
+                } else {
+                    shift += replacement.len() as isize - needle.len() as isize;
+                }
+            }
+            last = end;
+            count += 1;
+        }
+        if count == 0 {
+            return 0;
+        }
+        out.push_str(&self.text[last..]);
+        if !caret_fixed {
+            caret = shift_offset(cursor, shift);
+        }
+        if out != self.text {
+            self.splice(0..self.text.len(), &out, None);
+            let caret = caret.min(self.len());
+            self.selection = caret..caret;
+            self.reversed = false;
+        }
+        count
+    }
+
+    pub fn duplicate_line(&mut self) {
+        let (first, last) = self.selected_lines();
+        let span = self.line_byte_span(first, last);
+        let block = self.text[span.clone()].to_string();
+        let needs_break = !block.ends_with('\n');
+        let inserted = if needs_break {
+            let mut owned = String::with_capacity(block.len() + 1);
+            owned.push('\n');
+            owned.push_str(&block);
+            owned
+        } else {
+            block
+        };
+        let reversed = self.reversed;
+        let rel_start = self.selection.start - span.start;
+        let rel_end = self.selection.end - span.start;
+        let insert_at = span.end;
+        self.splice(insert_at..insert_at, &inserted, None);
+        let prefix = usize::from(needs_break);
+        let new_start = insert_at + prefix + rel_start;
+        let new_end = insert_at + prefix + rel_end;
+        self.selection = new_start..new_end;
+        self.reversed = reversed && new_start != new_end;
+    }
+
+    pub fn move_line_up(&mut self) -> bool {
+        let (first, last) = self.selected_lines();
+        if first == 0 {
+            return false;
+        }
+        let prev_span = self.line_byte_span(first - 1, first - 1);
+        let block_span = self.line_byte_span(first, last);
+        self.transpose_spans(prev_span, block_span.clone(), block_span);
+        true
+    }
+
+    pub fn move_line_down(&mut self) -> bool {
+        let (first, last) = self.selected_lines();
+        if last + 1 >= self.line_count() {
+            return false;
+        }
+        let block_span = self.line_byte_span(first, last);
+        let next_span = self.line_byte_span(last + 1, last + 1);
+        self.transpose_spans(block_span.clone(), next_span, block_span);
+        true
     }
 
     pub fn undo(&mut self) -> bool {
@@ -354,7 +486,7 @@ impl Buffer {
     }
 
     fn move_vertical(&mut self, delta: isize, select: bool) {
-        let (line, column) = self.line_col(self.cursor());
+        let (line, column) = self.line_col(self.snapped_cursor());
         let preferred = self.preferred_col.unwrap_or(column);
         let last = self.line_count() as isize - 1;
         let new_line = (line as isize + delta).clamp(0, last.max(0)) as usize;
@@ -364,7 +496,7 @@ impl Buffer {
     }
 
     fn move_to(&mut self, offset: usize, select: bool) {
-        let offset = self.clamp_offset(offset);
+        let offset = snap_grapheme(&self.text, offset);
         self.coalesce = Coalesce::None;
         self.preferred_col = None;
         if select {
@@ -448,23 +580,96 @@ impl Buffer {
     fn line_col(&self, offset: usize) -> (usize, usize) {
         let line = self.line_index(offset);
         let start = self.line_start(line);
-        let column = self.text[start..offset.min(self.text.len())]
-            .chars()
-            .count();
+        let end = offset.min(self.line_content_end(line)).max(start);
+        let column = self.text[start..end].graphemes(true).count();
         (line, column)
     }
 
     fn offset_at_column(&self, line: usize, column: usize) -> usize {
         let start = self.line_start(line);
         let end = self.line_content_end(line);
-        let mut offset = start;
-        for (index, ch) in self.text[start..end].chars().enumerate() {
-            if index == column {
-                return offset;
+        let mut seen = 0usize;
+        for (index, _) in self.text[start..end].grapheme_indices(true) {
+            if seen == column {
+                return start + index;
             }
-            offset += ch.len_utf8();
+            seen += 1;
         }
         end
+    }
+
+    fn snapped_cursor(&self) -> usize {
+        floor_grapheme(&self.text, self.cursor())
+    }
+
+    fn find_wrapping(&self, needle: &str, from: usize) -> Option<Range<usize>> {
+        if let Some(range) = self.find_literal(needle, from) {
+            return Some(range);
+        }
+        if from == 0 {
+            return None;
+        }
+        let range = self.find_literal(needle, 0)?;
+        (range.start < from).then_some(range)
+    }
+
+    fn selected_lines(&self) -> (usize, usize) {
+        let start_line = self.line_index(self.selection.start);
+        let mut end_line = self.line_index(self.selection.end);
+        if self.selection.end > self.selection.start
+            && end_line > start_line
+            && self.selection.end == self.line_start(end_line)
+        {
+            end_line -= 1;
+        }
+        (start_line, end_line)
+    }
+
+    fn line_byte_span(&self, first: usize, last: usize) -> Range<usize> {
+        let start = self.line_start(first);
+        let end = if last + 1 < self.line_count() {
+            self.line_start(last + 1)
+        } else {
+            self.text.len()
+        };
+        start..end
+    }
+
+    fn transpose_spans(&mut self, left: Range<usize>, right: Range<usize>, tracked: Range<usize>) {
+        let left_text = with_trailing_newline(&self.text[left.clone()]);
+        let right_text = with_trailing_newline(&self.text[right.clone()]);
+        let region_end = right.end;
+        // Both chunks are swapped with a trailing break. Drop that break when
+        // the region is EOF and the buffer did not already end with one.
+        let trim_eof = region_end == self.text.len() && !self.text.ends_with('\n');
+        let mut combined = String::with_capacity(left_text.len() + right_text.len());
+        combined.push_str(&right_text);
+        combined.push_str(&left_text);
+        if trim_eof {
+            combined.pop();
+        }
+        let tracks_right = tracked.start == right.start;
+        let (tracked_len, origin) = if tracks_right {
+            (right_text.len(), 0)
+        } else {
+            (left_text.len(), right_text.len())
+        };
+        let strip_end = trim_eof && !tracks_right;
+        let reversed = self.reversed;
+        let rel_start = self.selection.start - tracked.start;
+        let rel_end = self.selection.end - tracked.start;
+        let map = |rel: usize| {
+            if strip_end && rel >= tracked_len.saturating_sub(1) {
+                tracked_len - 1
+            } else {
+                rel
+            }
+        };
+        self.splice(left.start..region_end, &combined, None);
+        let start = left.start + origin + map(rel_start);
+        let end = left.start + origin + map(rel_end);
+        self.selection = start..end.max(start);
+        self.reversed = reversed && start != end;
     }
 }
 
@@ -492,6 +697,65 @@ fn floor_char(text: &str, mut offset: usize) -> usize {
         offset -= 1;
     }
     offset
+}
+
+fn floor_grapheme(text: &str, offset: usize) -> usize {
+    let offset = floor_char(text, offset.min(text.len()));
+    if offset == 0 || offset == text.len() {
+        return offset;
+    }
+    let line_start = text[..offset]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let mut boundary = line_start;
+    for (index, _) in text[line_start..].grapheme_indices(true) {
+        let abs = line_start + index;
+        if abs == offset {
+            return offset;
+        }
+        if abs > offset {
+            break;
+        }
+        boundary = abs;
+    }
+    boundary
+}
+
+fn snap_grapheme(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    if offset == text.len() {
+        return offset;
+    }
+    let start = floor_grapheme(text, offset);
+    if start == offset {
+        return offset;
+    }
+    let end = next_grapheme(text, start);
+    if offset >= end || offset - start > end - offset {
+        end
+    } else {
+        start
+    }
+}
+
+fn with_trailing_newline(chunk: &str) -> String {
+    if chunk.ends_with('\n') {
+        chunk.to_string()
+    } else {
+        let mut owned = String::with_capacity(chunk.len() + 1);
+        owned.push_str(chunk);
+        owned.push('\n');
+        owned
+    }
+}
+
+fn shift_offset(offset: usize, shift: isize) -> usize {
+    if shift >= 0 {
+        offset + shift as usize
+    } else {
+        offset.saturating_sub(shift.unsigned_abs())
+    }
 }
 
 fn leading_indent(line: &str) -> &str {
@@ -715,5 +979,262 @@ mod tests {
         buffer.move_doc_end(false);
         buffer.backspace();
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn undo_restores_reversed_selection_and_redo_clears() {
+        let mut buffer = Buffer::new("abcdef");
+        buffer.set_cursor(4, false);
+        buffer.move_left(true);
+        buffer.move_left(true);
+        assert_eq!(buffer.selection(), 2..4);
+        assert!(buffer.selection_reversed());
+        assert_eq!(buffer.cursor(), 2);
+        buffer.insert("Z");
+        assert_eq!(buffer.text(), "abZef");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "abcdef");
+        assert_eq!(buffer.selection(), 2..4);
+        assert!(buffer.selection_reversed());
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "abZef");
+        assert_eq!(buffer.cursor(), 3);
+        buffer.insert("!");
+        assert!(!buffer.redo());
+        assert_eq!(buffer.text(), "abZ!ef");
+    }
+
+    #[test]
+    fn checkpoint_and_delete_direction_split_undo_groups() {
+        let mut buffer = Buffer::new("");
+        buffer.insert("a");
+        buffer.insert("b");
+        buffer.checkpoint();
+        buffer.insert("c");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab");
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "abc");
+
+        let mut buffer = Buffer::new("abcd");
+        buffer.set_cursor(2, false);
+        buffer.backspace();
+        buffer.backspace();
+        assert_eq!(buffer.text(), "cd");
+        buffer.move_right(false);
+        buffer.delete();
+        assert_eq!(buffer.text(), "c");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "cd");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "abcd");
+    }
+
+    #[test]
+    fn undo_drops_snapshots_past_the_limit() {
+        let mut buffer = Buffer::new("");
+        let edits = UNDO_LIMIT + 3;
+        for _ in 0..edits {
+            buffer.insert("ab");
+        }
+        assert_eq!(buffer.text().len(), edits * 2);
+        for _ in 0..UNDO_LIMIT {
+            assert!(buffer.undo());
+        }
+        assert_eq!(buffer.text().len(), 6);
+        assert!(!buffer.undo());
+    }
+
+    #[test]
+    fn selection_anchor_stays_put_and_line_start_toggles_indent() {
+        let mut buffer = Buffer::new("abcdef");
+        buffer.set_cursor(3, false);
+        buffer.move_left(true);
+        buffer.move_left(true);
+        assert_eq!(buffer.selection(), 1..3);
+        assert!(buffer.selection_reversed());
+        buffer.move_right(true);
+        buffer.move_right(true);
+        buffer.move_right(true);
+        assert_eq!(buffer.selection(), 3..4);
+        assert!(!buffer.selection_reversed());
+        buffer.select_all();
+        assert_eq!(buffer.selected_text(), "abcdef");
+        buffer.insert("Q");
+        assert_eq!(buffer.text(), "Q");
+        assert!(buffer.undo());
+        assert_eq!(buffer.selected_text(), "abcdef");
+
+        let mut buffer = Buffer::new("    abc");
+        buffer.move_line_end(false);
+        buffer.move_line_start(false);
+        assert_eq!(buffer.cursor(), 4);
+        buffer.move_line_start(false);
+        assert_eq!(buffer.cursor(), 0);
+        buffer.move_line_start(false);
+        assert_eq!(buffer.cursor(), 4);
+
+        let mut buffer = Buffer::new("abcdef\nz");
+        buffer.move_line_end(false);
+        buffer.move_down(false);
+        assert_eq!(buffer.cursor_position(), (2, 2));
+        buffer.move_up(false);
+        assert_eq!(buffer.cursor_position(), (1, 7));
+    }
+
+    #[test]
+    fn grapheme_motion_covers_combining_marks_and_emoji() {
+        let mut buffer = Buffer::new("e\u{0301}x");
+        buffer.move_right(false);
+        assert_eq!(buffer.cursor(), "e\u{0301}".len());
+        buffer.move_right(false);
+        assert_eq!(buffer.cursor(), buffer.len());
+        buffer.backspace();
+        buffer.backspace();
+        assert!(buffer.is_empty());
+
+        let mut buffer = Buffer::new("e\u{0301}z");
+        buffer.set_cursor(1, false);
+        assert_eq!(buffer.cursor(), 0);
+        buffer.set_cursor(2, false);
+        assert_eq!(buffer.cursor(), "e\u{0301}".len());
+        buffer.delete();
+        assert_eq!(buffer.text(), "e\u{0301}");
+
+        let mut buffer = Buffer::new("e\u{0301}\nxy");
+        buffer.move_line_end(false);
+        assert_eq!(buffer.cursor_position(), (1, 2));
+        buffer.move_down(false);
+        assert_eq!(buffer.cursor_position(), (2, 2));
+        assert_eq!(&buffer.text()[buffer.cursor()..buffer.cursor() + 1], "y");
+        buffer.move_up(false);
+        assert_eq!(buffer.cursor_position(), (1, 2));
+
+        let emoji = "👨‍👩‍👧‍👦";
+        let toned = "👍🏽";
+        let mut buffer = Buffer::new(format!("{emoji}{toned}\nxy"));
+        buffer.move_right(false);
+        assert_eq!(buffer.cursor(), emoji.len());
+        buffer.move_right(false);
+        assert_eq!(buffer.cursor(), emoji.len() + toned.len());
+        assert_eq!(buffer.cursor_position(), (1, 3));
+        buffer.move_down(false);
+        assert_eq!(buffer.cursor_position(), (2, 3));
+        buffer.move_doc_start(false);
+        buffer.delete();
+        assert_eq!(buffer.text(), format!("{toned}\nxy"));
+        buffer.move_right(false);
+        buffer.backspace();
+        assert_eq!(buffer.text(), "\nxy");
+
+        let mut buffer = Buffer::new("e\u{0301} z");
+        buffer.move_word_right(false);
+        assert_eq!(buffer.cursor(), buffer.text().find('z').unwrap());
+    }
+
+    #[test]
+    fn literal_find_and_replace_are_case_sensitive() {
+        let mut buffer = Buffer::new("alpha beta alpha");
+        assert!(buffer.find_next("alpha"));
+        assert_eq!(buffer.selection(), 0..5);
+        assert!(buffer.find_next("alpha"));
+        assert_eq!(buffer.selection(), 11..16);
+        assert!(buffer.find_next("alpha"));
+        assert_eq!(buffer.selection(), 0..5);
+        assert!(!buffer.find_next("ALPHA"));
+        assert!(!buffer.find_next("a.c"));
+        assert!(!buffer.find_next(""));
+        assert_eq!(buffer.find_literal("beta", 0), Some(6..10));
+        assert_eq!(buffer.find_literal("alpha", 1), Some(11..16));
+
+        buffer.set_cursor(0, false);
+        assert!(buffer.replace_one("alpha", "ALPHA"));
+        assert_eq!(buffer.text(), "ALPHA beta alpha");
+        assert_eq!(buffer.cursor(), 5);
+        assert!(buffer.replace_one("alpha", "ALPHA"));
+        assert_eq!(buffer.text(), "ALPHA beta ALPHA");
+        assert!(!buffer.replace_one("missing", "x"));
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ALPHA beta alpha");
+
+        let mut buffer = Buffer::new("Foo foo FOO foo");
+        assert_eq!(buffer.replace_all("foo", "bar"), 2);
+        assert_eq!(buffer.text(), "Foo bar FOO bar");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "Foo foo FOO foo");
+        assert_eq!(buffer.replace_all("foo", "foo"), 2);
+        assert_eq!(buffer.text(), "Foo foo FOO foo");
+        assert!(!buffer.undo());
+
+        let mut buffer = Buffer::new("aaaa");
+        buffer.set_cursor(4, false);
+        assert_eq!(buffer.replace_all("aa", "b"), 2);
+        assert_eq!(buffer.text(), "bb");
+        assert_eq!(buffer.cursor(), 2);
+
+        let mut buffer = Buffer::new("abcdef");
+        buffer.set_cursor(3, false);
+        assert_eq!(buffer.replace_all("cd", "X"), 1);
+        assert_eq!(buffer.text(), "abXef");
+        assert_eq!(buffer.cursor(), 3);
+
+        let mut buffer = Buffer::new("café café");
+        assert!(buffer.find_next("fé"));
+        assert_eq!(buffer.selected_text(), "fé");
+        assert!(buffer.replace_one("fé", "fe"));
+        assert_eq!(buffer.text(), "cafe café");
+        assert_eq!(buffer.replace_all("", "nope"), 0);
+    }
+
+    #[test]
+    fn duplicate_and_move_lines_keep_the_column() {
+        let mut buffer = Buffer::new("ab\ncd");
+        buffer.set_cursor(1, false);
+        buffer.duplicate_line();
+        assert_eq!(buffer.text(), "ab\nab\ncd");
+        assert_eq!(buffer.cursor(), 4);
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "ab\ncd");
+        assert_eq!(buffer.cursor(), 1);
+
+        buffer.set_cursor(4, false);
+        buffer.duplicate_line();
+        assert_eq!(buffer.text(), "ab\ncd\ncd");
+        assert_eq!(buffer.cursor(), 7);
+
+        let mut buffer = Buffer::new("ab\ncd");
+        buffer.set_cursor(4, false);
+        assert!(buffer.move_line_up());
+        assert_eq!(buffer.text(), "cd\nab");
+        assert_eq!(buffer.cursor(), 1);
+        assert!(buffer.move_line_down());
+        assert_eq!(buffer.text(), "ab\ncd");
+        assert_eq!(buffer.cursor(), 4);
+        assert!(!buffer.move_line_down());
+        buffer.set_cursor(0, false);
+        assert!(!buffer.move_line_up());
+        assert_eq!(buffer.text(), "ab\ncd");
+
+        let mut buffer = Buffer::new("a\nb\nc\nd");
+        buffer.set_selection(2..5, false);
+        assert!(buffer.move_line_down());
+        assert_eq!(buffer.text(), "a\nd\nb\nc");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "a\nb\nc\nd");
+        buffer.set_selection(2..5, true);
+        assert!(buffer.move_line_up());
+        assert_eq!(buffer.text(), "b\nc\na\nd");
+        assert_eq!(buffer.selection(), 0..3);
+        assert!(buffer.selection_reversed());
+        buffer.move_doc_end(false);
+        assert!(!buffer.move_line_down());
+
+        let mut buffer = Buffer::new("one\n");
+        buffer.move_doc_end(false);
+        buffer.duplicate_line();
+        assert_eq!(buffer.text(), "one\n\n");
+        let mut buffer = Buffer::new("");
+        buffer.duplicate_line();
+        assert_eq!(buffer.text(), "\n");
     }
 }
