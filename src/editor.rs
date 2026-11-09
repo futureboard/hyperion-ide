@@ -118,6 +118,21 @@ pub fn bind_editor_keys(cx: &mut App) {
     ]);
 }
 
+enum KeyboardNav {
+    Left(bool),
+    Right(bool),
+    Up(bool),
+    Down(bool),
+    LineStart(bool),
+    LineEnd(bool),
+    DocStart(bool),
+    DocEnd(bool),
+    Vertical(isize, bool),
+    WordLeft(bool),
+    WordRight(bool),
+    SelectAll,
+}
+
 pub struct CodeEditor {
     focus: FocusHandle,
     scroll: ScrollHandle,
@@ -207,8 +222,12 @@ impl CodeEditor {
     }
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
-        self.buffer.select_all();
+        self.nav(KeyboardNav::SelectAll);
         cx.notify();
+    }
+
+    fn nav(&mut self, nav: KeyboardNav) {
+        apply_keyboard_nav(&mut self.buffer, &mut self.marked, nav);
     }
 
     fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -303,29 +322,47 @@ impl CodeEditor {
         )
     }
 
-    fn reveal_cursor(&self, _window: &mut Window) {
+    fn reveal_cursor(&self, window: &mut Window) {
         let Some(bounds) = self.last_bounds else {
             return;
         };
         let viewport = self.scroll.bounds();
-        if viewport.size.height <= px(0.) {
+        if viewport.size.height <= px(0.) && viewport.size.width <= px(0.) {
             return;
         }
         let line = self.buffer.line_index(self.buffer.cursor());
         let line_top = bounds.top() + px(PAD_PX + LINE_PX * line as f32);
         let line_bottom = line_top + px(LINE_PX);
-        let mut offset = self.scroll.offset();
-        if line_top < viewport.top() {
-            offset.y += viewport.top() - line_top;
-        } else if line_bottom > viewport.bottom() {
-            offset.y += viewport.bottom() - line_bottom;
-        }
-        let max = self.scroll.max_offset();
-        offset.y = offset.y.clamp(-max.y, px(0.));
-        offset.x = offset.x.clamp(-max.x, px(0.));
+        let (caret_left, caret_right) = self.caret_span_x(bounds.left(), window);
+        let offset = reveal_offset(
+            self.scroll.offset(),
+            self.scroll.max_offset(),
+            caret_left,
+            caret_right,
+            line_top,
+            line_bottom,
+            viewport,
+        );
         if offset != self.scroll.offset() {
             self.scroll.set_offset(offset);
         }
+    }
+
+    fn caret_span_x(&self, bounds_left: Pixels, window: &mut Window) -> (Pixels, Pixels) {
+        let line = self.buffer.line_index(self.buffer.cursor());
+        let line_start = self.buffer.line_start(line);
+        let content = self.buffer.line_content(line);
+        let column = self
+            .buffer
+            .cursor()
+            .saturating_sub(line_start)
+            .min(content.len());
+        let local = match shape_code(content, self.language, None, window) {
+            Some(shaped) => shaped.x_for_index(column),
+            None => px(column as f32 * FONT_PX * 0.62),
+        };
+        let left = bounds_left + px(gutter_px(self.buffer.line_count())) + local;
+        (left, left + px(2.))
     }
 
     fn edit_range(&mut self, range: Range<usize>, new_text: &str) {
@@ -357,9 +394,9 @@ impl EntityInputHandler for CodeEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.buffer.range_from_utf16(&range_utf16);
+        let range = ordered_range(self.buffer.range_from_utf16(&range_utf16));
         actual_range.replace(self.buffer.range_to_utf16(&range));
-        Some(self.buffer.text()[range].to_string())
+        Some(self.buffer.text().get(range).unwrap_or("").to_string())
     }
 
     fn selected_text_range(
@@ -475,87 +512,87 @@ impl Render for CodeEditor {
             .cursor(CursorStyle::IBeam)
             .bg(theme::editor_bg())
             .on_action(cx.listener(|this, _: &MoveLeft, window, cx| {
-                this.buffer.move_left(false);
+                this.nav(KeyboardNav::Left(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &MoveRight, window, cx| {
-                this.buffer.move_right(false);
+                this.nav(KeyboardNav::Right(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                this.buffer.move_up(false);
+                this.nav(KeyboardNav::Up(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &MoveDown, window, cx| {
-                this.buffer.move_down(false);
+                this.nav(KeyboardNav::Down(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectLeft, window, cx| {
-                this.buffer.move_left(true);
+                this.nav(KeyboardNav::Left(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectRight, window, cx| {
-                this.buffer.move_right(true);
+                this.nav(KeyboardNav::Right(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectUp, window, cx| {
-                this.buffer.move_up(true);
+                this.nav(KeyboardNav::Up(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectDown, window, cx| {
-                this.buffer.move_down(true);
+                this.nav(KeyboardNav::Down(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &LineStart, window, cx| {
-                this.buffer.move_line_start(false);
+                this.nav(KeyboardNav::LineStart(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &LineEnd, window, cx| {
-                this.buffer.move_line_end(false);
+                this.nav(KeyboardNav::LineEnd(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectLineStart, window, cx| {
-                this.buffer.move_line_start(true);
+                this.nav(KeyboardNav::LineStart(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectLineEnd, window, cx| {
-                this.buffer.move_line_end(true);
+                this.nav(KeyboardNav::LineEnd(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DocStart, window, cx| {
-                this.buffer.move_doc_start(false);
+                this.nav(KeyboardNav::DocStart(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DocEnd, window, cx| {
-                this.buffer.move_doc_end(false);
+                this.nav(KeyboardNav::DocEnd(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectDocStart, window, cx| {
-                this.buffer.move_doc_start(true);
+                this.nav(KeyboardNav::DocStart(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectDocEnd, window, cx| {
-                this.buffer.move_doc_end(true);
+                this.nav(KeyboardNav::DocEnd(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &PageUp, window, cx| {
                 let lines = this.page_lines();
-                this.buffer.move_vertical_by(-lines, false);
+                this.nav(KeyboardNav::Vertical(-lines, false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &PageDown, window, cx| {
                 let lines = this.page_lines();
-                this.buffer.move_vertical_by(lines, false);
+                this.nav(KeyboardNav::Vertical(lines, false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectPageUp, window, cx| {
                 let lines = this.page_lines();
-                this.buffer.move_vertical_by(-lines, true);
+                this.nav(KeyboardNav::Vertical(-lines, true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectPageDown, window, cx| {
                 let lines = this.page_lines();
-                this.buffer.move_vertical_by(lines, true);
+                this.nav(KeyboardNav::Vertical(lines, true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &Backspace, window, cx| {
@@ -579,19 +616,19 @@ impl Render for CodeEditor {
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &WordLeft, window, cx| {
-                this.buffer.move_word_left(false);
+                this.nav(KeyboardNav::WordLeft(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &WordRight, window, cx| {
-                this.buffer.move_word_right(false);
+                this.nav(KeyboardNav::WordRight(false));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectWordLeft, window, cx| {
-                this.buffer.move_word_left(true);
+                this.nav(KeyboardNav::WordLeft(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectWordRight, window, cx| {
-                this.buffer.move_word_right(true);
+                this.nav(KeyboardNav::WordRight(true));
                 this.changed(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
@@ -1023,6 +1060,81 @@ fn editor_font() -> Font {
     font
 }
 
+fn reveal_offset(
+    mut offset: Point<Pixels>,
+    max: Point<Pixels>,
+    item_left: Pixels,
+    item_right: Pixels,
+    item_top: Pixels,
+    item_bottom: Pixels,
+    viewport: Bounds<Pixels>,
+) -> Point<Pixels> {
+    if viewport.size.height > px(0.) {
+        offset.y = reveal_span(
+            offset.y,
+            max.y,
+            item_top,
+            item_bottom,
+            viewport.top(),
+            viewport.bottom(),
+        );
+    }
+    if viewport.size.width > px(0.) {
+        offset.x = reveal_span(
+            offset.x,
+            max.x,
+            item_left,
+            item_right,
+            viewport.left(),
+            viewport.right(),
+        );
+    }
+    offset
+}
+
+fn reveal_span(
+    mut offset: Pixels,
+    max_offset: Pixels,
+    start: Pixels,
+    end: Pixels,
+    view_start: Pixels,
+    view_end: Pixels,
+) -> Pixels {
+    if start < view_start {
+        offset += view_start - start;
+    } else if end > view_end {
+        offset += view_end - end;
+    }
+    offset.clamp(-max_offset, px(0.))
+}
+
+fn apply_keyboard_nav(buffer: &mut Buffer, marked: &mut Option<Range<usize>>, nav: KeyboardNav) {
+    // Clearing the mark ends the IME underline and keeps the next edit on the undo stack.
+    *marked = None;
+    match nav {
+        KeyboardNav::Left(select) => buffer.move_left(select),
+        KeyboardNav::Right(select) => buffer.move_right(select),
+        KeyboardNav::Up(select) => buffer.move_up(select),
+        KeyboardNav::Down(select) => buffer.move_down(select),
+        KeyboardNav::LineStart(select) => buffer.move_line_start(select),
+        KeyboardNav::LineEnd(select) => buffer.move_line_end(select),
+        KeyboardNav::DocStart(select) => buffer.move_doc_start(select),
+        KeyboardNav::DocEnd(select) => buffer.move_doc_end(select),
+        KeyboardNav::Vertical(lines, select) => buffer.move_vertical_by(lines, select),
+        KeyboardNav::WordLeft(select) => buffer.move_word_left(select),
+        KeyboardNav::WordRight(select) => buffer.move_word_right(select),
+        KeyboardNav::SelectAll => buffer.select_all(),
+    }
+}
+
+fn ordered_range(range: Range<usize>) -> Range<usize> {
+    if range.start <= range.end {
+        range
+    } else {
+        range.end..range.start
+    }
+}
+
 fn utf16_prefix_bytes(text: &str, utf16_offset: usize) -> usize {
     let mut seen = 0;
     for (index, ch) in text.char_indices() {
@@ -1032,4 +1144,114 @@ fn utf16_prefix_bytes(text: &str, utf16_offset: usize) -> usize {
         seen += ch.len_utf16();
     }
     text.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KeyboardNav, apply_keyboard_nav, ordered_range, reveal_offset};
+    use crate::buffer::Buffer;
+    use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn keyboard_motion_and_select_all_clear_the_ime_mark() {
+        let mut buffer = Buffer::new("alpha beta\nsecond line");
+        buffer.move_right(false);
+        let motions = [
+            KeyboardNav::Left(false),
+            KeyboardNav::Right(false),
+            KeyboardNav::Up(false),
+            KeyboardNav::Down(false),
+            KeyboardNav::Left(true),
+            KeyboardNav::Right(true),
+            KeyboardNav::Up(true),
+            KeyboardNav::Down(true),
+            KeyboardNav::LineStart(false),
+            KeyboardNav::LineEnd(false),
+            KeyboardNav::LineStart(true),
+            KeyboardNav::LineEnd(true),
+            KeyboardNav::DocStart(false),
+            KeyboardNav::DocEnd(false),
+            KeyboardNav::DocStart(true),
+            KeyboardNav::DocEnd(true),
+            KeyboardNav::Vertical(-4, false),
+            KeyboardNav::Vertical(4, true),
+            KeyboardNav::WordLeft(false),
+            KeyboardNav::WordRight(false),
+            KeyboardNav::WordLeft(true),
+            KeyboardNav::WordRight(true),
+            KeyboardNav::SelectAll,
+        ];
+        for motion in motions {
+            let mut marked = Some(0..1);
+            apply_keyboard_nav(&mut buffer, &mut marked, motion);
+            assert!(marked.is_none());
+        }
+        assert_eq!(buffer.selection(), 0..buffer.len());
+    }
+
+    #[test]
+    fn inverted_utf16_text_range_does_not_panic() {
+        let buffer = Buffer::new("a😀b");
+        let forwards = buffer.range_from_utf16(&(1..3));
+        let backwards = buffer.range_from_utf16(&(3..1));
+        assert_eq!(forwards, backwards);
+        let text = buffer
+            .text()
+            .get(ordered_range(backwards))
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(text, "😀");
+        assert_eq!(buffer.text().get(ordered_range(6..1)).unwrap_or(""), "😀b");
+    }
+
+    #[test]
+    fn reveal_offset_scrolls_horizontally_when_the_caret_is_outside() {
+        let viewport = Bounds::new(point(px(0.), px(0.)), size(px(200.), px(100.)));
+        let max = point(px(800.), px(400.));
+        let next = reveal_offset(
+            point(px(0.), px(0.)),
+            max,
+            px(400.),
+            px(402.),
+            px(8.),
+            px(30.),
+            viewport,
+        );
+        assert_eq!(next.x, px(-202.));
+        assert_eq!(next.y, px(0.));
+
+        let back = reveal_offset(
+            point(px(-300.), px(0.)),
+            max,
+            px(-290.),
+            px(-288.),
+            px(8.),
+            px(30.),
+            viewport,
+        );
+        assert_eq!(back.x, px(-10.));
+
+        let parked = reveal_offset(
+            point(px(-40.), px(-12.)),
+            max,
+            px(80.),
+            px(82.),
+            px(20.),
+            px(42.),
+            viewport,
+        );
+        assert_eq!(parked.x, px(-40.));
+        assert_eq!(parked.y, px(-12.));
+
+        let clamped = reveal_offset(
+            point(px(0.), px(0.)),
+            point(px(10.), px(10.)),
+            px(400.),
+            px(402.),
+            px(8.),
+            px(30.),
+            viewport,
+        );
+        assert_eq!(clamped.x, px(-10.));
+    }
 }

@@ -204,7 +204,7 @@ impl Palette {
 }
 
 /// Paints the current query and rows. Clicks report the command id.
-/// The shell owns [`Palette`] and does not mount this from `app`.
+/// The shell owns [`Palette`].
 ///
 /// The selected title is the only accent, so the row that would run is the one mark.
 pub fn command_palette(

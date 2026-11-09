@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, Menu, MenuItem,
-    MouseDownEvent, PathPromptOptions, PromptLevel, Render, Window, WindowHandle, actions, div,
-    prelude::*, px,
+    App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, KeystrokeEvent, Menu,
+    MenuItem, MouseDownEvent, PathPromptOptions, PromptLevel, Render, SharedString, Subscription,
+    Window, WindowHandle, actions, div, prelude::*, px,
 };
 
+use crate::command;
 use crate::editor::CodeEditor;
 use crate::persist;
 use crate::theme;
@@ -17,7 +18,14 @@ const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 actions!(
     hyperion,
     [
-        OpenFile, OpenFolder, NewFile, Save, CloseTab, Quit, CloseMenu
+        OpenFile,
+        OpenFolder,
+        NewFile,
+        Save,
+        CloseTab,
+        Quit,
+        CloseMenu,
+        CommandPalette,
     ]
 );
 
@@ -68,6 +76,11 @@ pub struct Ide {
     menu: Option<MenuId>,
     dialog: bool,
     close_guard: bool,
+    commands: command::CommandRegistry,
+    palette: Option<command::Palette>,
+    palette_focus: FocusHandle,
+    #[allow(dead_code)]
+    palette_keys: Subscription,
 }
 
 impl Ide {
@@ -78,6 +91,12 @@ impl Ide {
             None => FileTree::empty(),
         };
         let status = tree.error.clone().unwrap_or_else(|| "Ready".to_string());
+        let palette_focus = cx.focus_handle();
+        let entity = cx.entity();
+        // Swallow keys while the palette is open so typing edits the query.
+        let palette_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            entity.update(cx, |ide, cx| ide.handle_palette_key(event, window, cx));
+        });
         Self {
             focus: cx.focus_handle(),
             root,
@@ -90,6 +109,10 @@ impl Ide {
             menu: None,
             dialog: false,
             close_guard: false,
+            commands: command::CommandRegistry::builtin(),
+            palette: None,
+            palette_focus,
+            palette_keys,
         }
     }
 
@@ -130,10 +153,125 @@ impl Ide {
         self.quit(window, cx);
     }
 
-    fn on_close_menu(&mut self, _: &CloseMenu, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_close_menu(&mut self, _: &CloseMenu, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+            return;
+        }
         if self.menu.take().is_some() {
             cx.notify();
         }
+    }
+
+    fn on_command_palette(
+        &mut self,
+        _: &CommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = None;
+        self.palette = Some(command::Palette::new());
+        self.palette_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_none() {
+            return;
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn pick_palette(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.commands.record(id);
+        self.palette = None;
+        self.run_command(id, window, cx);
+        self.focus_active(window, cx);
+    }
+
+    fn handle_palette_key(
+        &mut self,
+        event: &KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette.is_none() {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        if mods.secondary()
+            && mods.shift
+            && !mods.alt
+            && !mods.function
+            && key.eq_ignore_ascii_case("p")
+        {
+            return;
+        }
+        if key == "escape" {
+            self.close_palette(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        let typing = mods.is_subset_of(&gpui::Modifiers::shift());
+        if typing {
+            match key {
+                "up" => {
+                    let visible = self.palette_visible();
+                    if let Some(palette) = self.palette.as_mut() {
+                        palette.move_up(visible);
+                    }
+                }
+                "down" => {
+                    let visible = self.palette_visible();
+                    if let Some(palette) = self.palette.as_mut() {
+                        palette.move_down(visible);
+                    }
+                }
+                "enter" => {
+                    self.accept_palette(window, cx);
+                }
+                "backspace" => {
+                    if let Some(palette) = self.palette.as_mut() {
+                        let mut query = palette.query().to_string();
+                        query.pop();
+                        palette.set_query(query);
+                    }
+                }
+                _ => {
+                    if let Some(ch) = event.keystroke.key_char.as_deref()
+                        && !ch.chars().any(|c| c.is_control())
+                        && let Some(palette) = self.palette.as_mut()
+                    {
+                        let mut query = palette.query().to_string();
+                        query.push_str(ch);
+                        palette.set_query(query);
+                    }
+                }
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn palette_visible(&self) -> usize {
+        let Some(palette) = &self.palette else {
+            return 0;
+        };
+        self.commands.filter(palette.query()).len()
+    }
+
+    fn accept_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = self.palette.clone() else {
+            return;
+        };
+        let rows = self.commands.filter(palette.query());
+        let Some(id) = palette.selected_id(&rows) else {
+            return;
+        };
+        let id = id.to_string();
+        self.pick_palette(&id, window, cx);
     }
 
     fn toggle_menu(&mut self, menu: MenuId, cx: &mut Context<Self>) {
@@ -765,6 +903,22 @@ impl Render for Ide {
             .map(|path| file_title(path))
             .unwrap_or_else(|| "No folder".into());
         let menu = self.menu;
+        let visible = self
+            .palette
+            .as_ref()
+            .map(|palette| self.commands.filter(palette.query()).len());
+        if let Some(visible) = visible
+            && let Some(palette) = self.palette.as_mut()
+        {
+            palette.clamp(visible);
+        }
+        let palette_view = self.palette.as_ref().map(|palette| {
+            let rows = self.commands.filter(palette.query());
+            let selected = palette.selected_index();
+            (SharedString::from(palette.query()), rows, selected)
+        });
+        let palette_left = ((window.bounds().size.width - px(420.)) / 2.).max(px(0.));
+        let palette_focus = self.palette_focus.clone();
         let active_editor = self
             .active
             .and_then(|ix| self.tabs.get(ix))
@@ -786,6 +940,7 @@ impl Render for Ide {
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_close_menu))
+            .on_action(cx.listener(Self::on_command_palette))
             .child(ui::menu_bar(
                 cx.listener(|ide, _: &ClickEvent, _, cx| ide.toggle_menu(MenuId::File, cx)),
                 cx.listener(|ide, _: &ClickEvent, _, cx| ide.toggle_menu(MenuId::Edit, cx)),
@@ -829,6 +984,40 @@ impl Render for Ide {
                         });
                     },
                 ))
+            })
+            .when(palette_view.is_some(), |this| {
+                let (query, rows, selected) = palette_view.unwrap();
+                let pick = entity.clone();
+                let dismiss = entity.clone();
+                this.child(
+                    div()
+                        .absolute()
+                        .size_full()
+                        .top_0()
+                        .left_0()
+                        .child(div().size_full().on_mouse_down(
+                            gpui::MouseButton::Left,
+                            move |_: &MouseDownEvent, window, cx| {
+                                dismiss.update(cx, |ide, cx| ide.close_palette(window, cx));
+                            },
+                        ))
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(42.))
+                                .left(palette_left)
+                                .track_focus(&palette_focus)
+                                .key_context("CommandPalette")
+                                .child(command::command_palette(
+                                    query,
+                                    rows,
+                                    selected,
+                                    move |id, window, cx| {
+                                        pick.update(cx, |ide, cx| ide.pick_palette(id, window, cx));
+                                    },
+                                )),
+                        ),
+                )
             })
     }
 }
@@ -1037,14 +1226,18 @@ impl Ide {
 }
 
 fn indent_guides(depth: usize) -> impl IntoElement {
-    div().h(px(26.)).flex().flex_row().children((0..depth).map(|_| {
-        div()
-            .w(px(14.))
-            .h(px(26.))
-            .flex()
-            .justify_center()
-            .child(div().w(px(1.)).h(px(26.)).bg(theme::border()))
-    }))
+    div()
+        .h(px(26.))
+        .flex()
+        .flex_row()
+        .children((0..depth).map(|_| {
+            div()
+                .w(px(14.))
+                .h(px(26.))
+                .flex()
+                .justify_center()
+                .child(div().w(px(1.)).h(px(26.)).bg(theme::border()))
+        }))
 }
 
 fn menu_entries(menu: MenuId) -> Vec<MenuEntry> {

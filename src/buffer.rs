@@ -163,7 +163,10 @@ impl Buffer {
     }
 
     pub fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.utf16_to_offset(range.start)..self.utf16_to_offset(range.end)
+        // Input methods sometimes report the utf16 range backwards.
+        let start = self.utf16_to_offset(range.start);
+        let end = self.utf16_to_offset(range.end);
+        if start <= end { start..end } else { end..start }
     }
 
     pub fn insert(&mut self, text: &str) {
@@ -1236,5 +1239,20 @@ mod tests {
         let mut buffer = Buffer::new("");
         buffer.duplicate_line();
         assert_eq!(buffer.text(), "\n");
+    }
+
+    #[test]
+    fn inverted_utf16_range_is_ordered_for_slicing() {
+        let buffer = Buffer::new("hello");
+        assert_eq!(buffer.range_from_utf16(&(1..4)), 1..4);
+        assert_eq!(buffer.range_from_utf16(&(4..1)), 1..4);
+        assert_eq!(&buffer.text()[buffer.range_from_utf16(&(4..1))], "ell");
+
+        let buffer = Buffer::new("a😀b");
+        assert_eq!(buffer.range_from_utf16(&(1..3)), 1..5);
+        assert_eq!(buffer.range_from_utf16(&(3..1)), 1..5);
+        assert_eq!(&buffer.text()[buffer.range_from_utf16(&(3..1))], "😀");
+        assert_eq!(buffer.range_from_utf16(&(4..0)), 0..buffer.len());
+        assert_eq!(&buffer.text()[buffer.range_from_utf16(&(0..0))], "");
     }
 }
