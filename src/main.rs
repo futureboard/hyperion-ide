@@ -3,6 +3,7 @@ mod buffer;
 mod command;
 mod editor;
 mod highlight;
+mod persist;
 mod theme;
 mod ui;
 mod workspace;
