@@ -1,5 +1,6 @@
 mod app;
 mod buffer;
+mod command;
 mod editor;
 mod highlight;
 mod theme;
