@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
@@ -8,6 +7,7 @@ use gpui::{
 };
 
 use crate::editor::CodeEditor;
+use crate::persist;
 use crate::theme;
 use crate::ui::{self, MenuEntry, MenuId, StatusInfo, TabItem};
 use crate::workspace::{FileTree, display_path, file_title, language_name, same_file};
@@ -52,6 +52,7 @@ struct Tab {
     path: Option<PathBuf>,
     title: String,
     lossy: bool,
+    stamp: Option<persist::FileStamp>,
     editor: Entity<CodeEditor>,
 }
 
@@ -66,6 +67,7 @@ pub struct Ide {
     status: String,
     menu: Option<MenuId>,
     dialog: bool,
+    close_guard: bool,
 }
 
 impl Ide {
@@ -87,6 +89,7 @@ impl Ide {
             status,
             menu: None,
             dialog: false,
+            close_guard: false,
         }
     }
 
@@ -193,6 +196,7 @@ impl Ide {
             path: None,
             title,
             lossy: false,
+            stamp: None,
             editor,
         });
         self.active = Some(self.tabs.len() - 1);
@@ -281,11 +285,12 @@ impl Ide {
             cx.notify();
             return;
         }
-        match read_file(&path) {
-            Ok((text, lossy)) => {
+        match persist::read_text_file(&path, MAX_FILE_BYTES) {
+            Ok(opened) => {
                 let title = file_title(&path);
+                let lossy = opened.lossy;
                 let editor = cx.new(|cx| {
-                    let mut editor = CodeEditor::new(text, cx);
+                    let mut editor = CodeEditor::new(opened.text, cx);
                     editor.set_language_from_path(&path);
                     editor
                 });
@@ -295,6 +300,7 @@ impl Ide {
                     path: Some(path.clone()),
                     title: title.clone(),
                     lossy,
+                    stamp: Some(opened.stamp),
                     editor,
                 });
                 self.active = Some(self.tabs.len() - 1);
@@ -306,7 +312,7 @@ impl Ide {
                 self.tree.expand_to(&path);
                 self.focus_active(window, cx);
             }
-            Err(error) => self.status = error,
+            Err(error) => self.status = error.to_string(),
         }
         cx.notify();
     }
@@ -319,11 +325,16 @@ impl Ide {
         };
         if self.tabs[ix].path.is_none() {
             self.save_as(ix, false, window, cx);
-        } else if self.write_tab(ix, cx) {
-            cx.notify();
-        } else {
-            cx.notify();
+            return;
         }
+        if self.tabs[ix].lossy {
+            let id = self.tabs[ix].id;
+            self.confirm_lossy_save(id, false, window, cx);
+            return;
+        }
+        let id = self.tabs[ix].id;
+        self.save_tab(id, false, cx);
+        cx.notify();
     }
 
     fn save_as(
@@ -357,12 +368,21 @@ impl Ide {
                 };
                 match picked {
                     Ok(Ok(Some(path))) => {
-                        this.tabs[ix].path = Some(path.clone());
-                        this.tabs[ix].title = file_title(&path);
-                        if this.write_tab(ix, cx) && close_after {
-                            this.remove_tab(ix, window, cx);
+                        let same = this.tabs[ix]
+                            .path
+                            .as_deref()
+                            .is_some_and(|open| same_file(open, &path));
+                        if this.tabs[ix].lossy && same {
+                            this.confirm_lossy_save(tab_id, close_after, window, cx);
+                        } else {
+                            let saved = this.save_path(ix, &path, false, cx);
+                            if saved {
+                                this.tree.refresh();
+                                if close_after && let Some(ix) = this.index_of(tab_id) {
+                                    this.remove_tab(ix, window, cx);
+                                }
+                            }
                         }
-                        this.tree.refresh();
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(error)) => this.status = format!("Save failed: {error}"),
@@ -375,25 +395,112 @@ impl Ide {
         .detach();
     }
 
-    fn write_tab(&mut self, ix: usize, cx: &mut Context<Self>) -> bool {
+    fn confirm_lossy_save(
+        &mut self,
+        id: u64,
+        close_after: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.index_of(id) else {
+            return;
+        };
+        if self.dialog {
+            self.status = "Finish the open dialog first".into();
+            cx.notify();
+            return;
+        }
+        self.dialog = true;
+        let label = self.tabs[ix].title.clone();
+        let rx = window.prompt(
+            PromptLevel::Warning,
+            &format!("Save {label} over its original bytes?"),
+            Some("It was opened with lossy UTF-8. Saving replaces bytes that did not decode."),
+            &["Save", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, async_cx| {
+            let answer = rx.await.unwrap_or(1);
+            this.update_in(async_cx, |this, window, cx| {
+                this.dialog = false;
+                if answer == 0 && this.save_tab(id, true, cx) && close_after {
+                    if let Some(ix) = this.index_of(id) {
+                        this.remove_tab(ix, window, cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn save_tab(&mut self, id: u64, acknowledge_lossy: bool, cx: &mut Context<Self>) -> bool {
+        let Some(ix) = self.index_of(id) else {
+            return false;
+        };
         let Some(path) = self.tabs[ix].path.clone() else {
             return false;
         };
+        self.save_path(ix, &path, acknowledge_lossy, cx)
+    }
+
+    fn save_path(
+        &mut self,
+        ix: usize,
+        path: &Path,
+        acknowledge_lossy: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let saved = self.write_to(ix, path, acknowledge_lossy, cx);
+        self.commit_save(ix, path, saved, cx);
+        saved
+    }
+
+    fn write_to(
+        &mut self,
+        ix: usize,
+        path: &Path,
+        acknowledge_lossy: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let same = self.tabs[ix]
+            .path
+            .as_deref()
+            .is_some_and(|open| same_file(open, path));
+        let baseline = if same { self.tabs[ix].stamp } else { None };
+        let lossy = same && self.tabs[ix].lossy;
         let text = self.tabs[ix].editor.read(cx).text().to_string();
-        match fs::write(&path, text) {
-            Ok(()) => {
-                self.tabs[ix].editor.update(cx, |editor, cx| {
-                    editor.mark_saved();
-                    cx.notify();
-                });
-                self.tabs[ix].lossy = false;
-                self.status = format!("Saved {}", display_path(self.root.as_deref(), &path));
+        match persist::save_text(path, &text, baseline.as_ref(), lossy, acknowledge_lossy) {
+            Ok(stamp) => {
+                self.tabs[ix].stamp = Some(stamp);
+                self.status = format!("Saved {}", display_path(self.root.as_deref(), path));
                 true
             }
             Err(error) => {
                 self.status = format!("Save failed: {error}");
                 false
             }
+        }
+    }
+
+    fn commit_save(&mut self, ix: usize, path: &Path, saved: bool, cx: &mut Context<Self>) {
+        let mut state = SaveAsState {
+            path: self.tabs[ix].path.clone(),
+            title: self.tabs[ix].title.clone(),
+            dirty: self.tabs[ix].editor.read(cx).is_dirty(),
+            lossy: self.tabs[ix].lossy,
+        };
+        apply_save_as(&mut state, path.to_path_buf(), file_title(path), saved);
+        self.tabs[ix].path = state.path;
+        self.tabs[ix].title = state.title;
+        self.tabs[ix].lossy = state.lossy;
+        if saved && !state.dirty {
+            self.tabs[ix].editor.update(cx, |editor, cx| {
+                editor.set_language_from_path(path);
+                editor.mark_saved();
+                cx.notify();
+            });
         }
     }
 
@@ -430,8 +537,12 @@ impl Ide {
                 match answer {
                     0 => {
                         if this.tabs[ix].path.is_some() {
-                            if this.write_tab(ix, cx) {
-                                this.remove_tab(ix, window, cx);
+                            if this.tabs[ix].lossy {
+                                this.confirm_lossy_save(id, true, window, cx);
+                            } else if this.save_tab(id, false, cx) {
+                                if let Some(ix) = this.index_of(id) {
+                                    this.remove_tab(ix, window, cx);
+                                }
                             }
                         } else {
                             this.save_as(ix, true, window, cx);
@@ -448,15 +559,17 @@ impl Ide {
     }
 
     fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dirty = self.tabs.iter().any(|tab| tab.editor.read(cx).is_dirty());
-        if !dirty {
-            cx.quit();
-            return;
+        match quit_choice(self.any_dirty(cx), self.dialog) {
+            CloseChoice::Proceed => cx.quit(),
+            CloseChoice::Stay => {
+                self.status = "Finish the open dialog before closing.".into();
+                cx.notify();
+            }
+            CloseChoice::Ask => self.prompt_quit(window, cx),
         }
-        if self.dialog {
-            cx.quit();
-            return;
-        }
+    }
+
+    fn prompt_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog = true;
         let rx = window.prompt(
             PromptLevel::Warning,
@@ -478,6 +591,40 @@ impl Ide {
             .ok();
         })
         .detach();
+    }
+
+    fn any_dirty(&self, cx: &App) -> bool {
+        self.tabs.iter().any(|tab| tab.editor.read(cx).is_dirty())
+    }
+
+    fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match quit_choice(self.any_dirty(cx), self.dialog) {
+            CloseChoice::Proceed => true,
+            CloseChoice::Stay => {
+                self.status = "Finish the open dialog before closing.".into();
+                cx.notify();
+                false
+            }
+            CloseChoice::Ask => {
+                // gpui closes the window only when this returns true.
+                self.prompt_quit(window, cx);
+                false
+            }
+        }
+    }
+
+    fn install_close_guard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_guard {
+            return;
+        }
+        self.close_guard = true;
+        let entity = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            let Some(handle) = entity.upgrade() else {
+                return true;
+            };
+            handle.update(cx, |ide, cx| ide.should_close(window, cx))
+        });
     }
 
     fn activate_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -598,6 +745,7 @@ impl Ide {
 
 impl Render for Ide {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.install_close_guard(window, cx);
         window.set_window_title(&self.window_title(cx));
         let entity = cx.entity();
         let tabs: Vec<TabItem> = self
@@ -972,24 +1120,82 @@ fn menu_entries(menu: MenuId) -> Vec<MenuEntry> {
     }
 }
 
-fn read_file(path: &Path) -> Result<(String, bool), String> {
-    let meta = fs::metadata(path).map_err(|error| error.to_string())?;
-    if meta.is_dir() {
-        return Err("That path is a folder".into());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseChoice {
+    Proceed,
+    Ask,
+    Stay,
+}
+
+fn quit_choice(any_dirty: bool, dialog_open: bool) -> CloseChoice {
+    if !any_dirty {
+        CloseChoice::Proceed
+    } else if dialog_open {
+        CloseChoice::Stay
+    } else {
+        CloseChoice::Ask
     }
-    if meta.len() > MAX_FILE_BYTES {
-        return Err("File is larger than 8 MiB".into());
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SaveAsState {
+    path: Option<PathBuf>,
+    title: String,
+    dirty: bool,
+    lossy: bool,
+}
+
+fn apply_save_as(state: &mut SaveAsState, path: PathBuf, title: String, saved: bool) {
+    if !saved {
+        return;
     }
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    let lossy = std::str::from_utf8(&bytes).is_err();
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), lossy))
+    state.path = Some(path);
+    state.title = title;
+    state.dirty = false;
+    state.lossy = false;
 }
 
 pub fn focus_window(window: WindowHandle<Ide>, cx: &mut App) {
     window
         .update(cx, |ide, window, cx| {
+            ide.install_close_guard(window, cx);
             ide.focus_root(window, cx);
             cx.activate(true);
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_from_menu_asks_before_discarding_dirty_buffers() {
+        assert_eq!(quit_choice(false, false), CloseChoice::Proceed);
+        assert_eq!(quit_choice(true, false), CloseChoice::Ask);
+        assert_eq!(quit_choice(true, true), CloseChoice::Stay);
+        assert_eq!(quit_choice(false, true), CloseChoice::Proceed);
+    }
+
+    #[test]
+    fn failed_save_as_does_not_claim_the_new_path() {
+        let mut state = SaveAsState {
+            path: None,
+            title: "untitled".into(),
+            dirty: true,
+            lossy: true,
+        };
+        let attempted = PathBuf::from("/tmp/notes.txt");
+        apply_save_as(&mut state, attempted.clone(), "notes.txt".into(), false);
+        assert_eq!(state.path, None);
+        assert_eq!(state.title, "untitled");
+        assert!(state.dirty);
+        assert!(state.lossy);
+
+        apply_save_as(&mut state, attempted.clone(), "notes.txt".into(), true);
+        assert_eq!(state.path, Some(attempted));
+        assert_eq!(state.title, "notes.txt");
+        assert!(!state.dirty);
+        assert!(!state.lossy);
+    }
 }
