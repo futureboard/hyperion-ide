@@ -11,6 +11,7 @@ use gpui::{
 };
 
 use crate::buffer::{self, Buffer};
+use crate::find::{FindEffect, FindQuery};
 use crate::highlight;
 use crate::theme;
 
@@ -224,6 +225,49 @@ impl CodeEditor {
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
         self.nav(KeyboardNav::SelectAll);
         cx.notify();
+    }
+
+    pub fn find_next(
+        &mut self,
+        query: &FindQuery,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> FindEffect {
+        let effect = query.find_next(&mut self.buffer);
+        self.finish_find(effect, window, cx)
+    }
+
+    pub fn replace_one(
+        &mut self,
+        query: &FindQuery,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> FindEffect {
+        let effect = query.replace_one(&mut self.buffer);
+        self.finish_find(effect, window, cx)
+    }
+
+    pub fn replace_all(
+        &mut self,
+        query: &FindQuery,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> FindEffect {
+        let effect = query.replace_all(&mut self.buffer);
+        self.finish_find(effect, window, cx)
+    }
+
+    fn finish_find(
+        &mut self,
+        effect: FindEffect,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> FindEffect {
+        if effect.redraws() {
+            self.marked = None;
+            self.changed(window, cx);
+        }
+        effect
     }
 
     fn nav(&mut self, nav: KeyboardNav) {

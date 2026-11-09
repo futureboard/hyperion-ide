@@ -8,6 +8,7 @@ use gpui::{
 
 use crate::command;
 use crate::editor::CodeEditor;
+use crate::find::{self, FindEffect, FindQuery};
 use crate::persist;
 use crate::theme;
 use crate::ui::{self, MenuEntry, MenuId, StatusInfo, TabItem};
@@ -26,6 +27,7 @@ actions!(
         Quit,
         CloseMenu,
         CommandPalette,
+        Find,
     ]
 );
 
@@ -51,6 +53,8 @@ pub fn install_menus(cx: &mut App) {
             MenuItem::action("Copy", crate::editor::Copy),
             MenuItem::action("Paste", crate::editor::Paste),
             MenuItem::action("Select All", crate::editor::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("Find", Find),
         ]),
     ]);
 }
@@ -79,8 +83,11 @@ pub struct Ide {
     commands: command::CommandRegistry,
     palette: Option<command::Palette>,
     palette_focus: FocusHandle,
+    find_query: FindQuery,
+    find_open: bool,
+    find_focus: FocusHandle,
     #[allow(dead_code)]
-    palette_keys: Subscription,
+    keys: Subscription,
 }
 
 impl Ide {
@@ -92,10 +99,14 @@ impl Ide {
         };
         let status = tree.error.clone().unwrap_or_else(|| "Ready".to_string());
         let palette_focus = cx.focus_handle();
+        let find_focus = cx.focus_handle();
         let entity = cx.entity();
-        // Swallow keys while the palette is open so typing edits the query.
-        let palette_keys = cx.intercept_keystrokes(move |event, window, cx| {
-            entity.update(cx, |ide, cx| ide.handle_palette_key(event, window, cx));
+        // Swallow palette keys, and find-bar keys while that field is focused.
+        let keys = cx.intercept_keystrokes(move |event, window, cx| {
+            entity.update(cx, |ide, cx| {
+                ide.handle_palette_key(event, window, cx);
+                ide.handle_find_key(event, window, cx);
+            });
         });
         Self {
             focus: cx.focus_handle(),
@@ -112,7 +123,10 @@ impl Ide {
             commands: command::CommandRegistry::builtin(),
             palette: None,
             palette_focus,
-            palette_keys,
+            find_query: FindQuery::new(),
+            find_open: false,
+            find_focus,
+            keys,
         }
     }
 
@@ -160,6 +174,10 @@ impl Ide {
         }
         if self.menu.take().is_some() {
             cx.notify();
+            return;
+        }
+        if self.find_open {
+            self.close_find(window, cx);
         }
     }
 
@@ -170,9 +188,14 @@ impl Ide {
         cx: &mut Context<Self>,
     ) {
         self.menu = None;
+        self.find_open = false;
         self.palette = Some(command::Palette::new());
         self.palette_focus.focus(window, cx);
         cx.notify();
+    }
+
+    fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(window, cx);
     }
 
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -187,7 +210,11 @@ impl Ide {
         self.commands.record(id);
         self.palette = None;
         self.run_command(id, window, cx);
-        self.focus_active(window, cx);
+        if self.find_open {
+            self.find_focus.focus(window, cx);
+        } else {
+            self.focus_active(window, cx);
+        }
     }
 
     fn handle_palette_key(
@@ -206,6 +233,15 @@ impl Ide {
             && !mods.alt
             && !mods.function
             && key.eq_ignore_ascii_case("p")
+        {
+            return;
+        }
+        // Find replaces the palette, so this chord has to reach the action.
+        if mods.secondary()
+            && !mods.shift
+            && !mods.alt
+            && !mods.function
+            && key.eq_ignore_ascii_case("f")
         {
             return;
         }
@@ -255,6 +291,124 @@ impl Ide {
         cx.notify();
     }
 
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.palette = None;
+        self.find_open = true;
+        self.find_query.focus_needle();
+        self.find_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        self.find_open = false;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn on_find_action(
+        &mut self,
+        action: ui::FindAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            ui::FindAction::Needle => self.find_query.focus_field(find::FindField::Needle),
+            ui::FindAction::Replacement => {
+                self.find_query.focus_field(find::FindField::Replacement)
+            }
+            ui::FindAction::ReplaceOne => self.replace_find(window, cx),
+            ui::FindAction::ReplaceAll => self.replace_all_find(window, cx),
+        }
+        self.find_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    // Keys apply only while the find field is focused, so the open bar does not block the editor.
+    fn handle_find_key(
+        &mut self,
+        event: &KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.find_open || !self.find_focus.is_focused(window) {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        if key == "escape" {
+            return;
+        }
+        let typing = mods.is_subset_of(&gpui::Modifiers::shift());
+        if !typing {
+            return;
+        }
+        match key {
+            "enter" => self.search_find(window, cx),
+            "tab" => self.find_query.toggle_field(),
+            "backspace" => self.find_query.backspace(),
+            _ => {
+                if let Some(ch) = event.keystroke.key_char.as_deref()
+                    && !ch.chars().any(|c| c.is_control())
+                {
+                    self.find_query.insert(ch);
+                }
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn search_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_find(window, cx, |editor, query, window, cx| {
+            editor.find_next(query, window, cx)
+        });
+    }
+
+    fn replace_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_find(window, cx, |editor, query, window, cx| {
+            editor.replace_one(query, window, cx)
+        });
+    }
+
+    fn replace_all_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_find(window, cx, |editor, query, window, cx| {
+            editor.replace_all(query, window, cx)
+        });
+    }
+
+    fn edit_find(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(
+            &mut CodeEditor,
+            &FindQuery,
+            &mut Window,
+            &mut Context<CodeEditor>,
+        ) -> FindEffect,
+    ) {
+        if self.find_query.needle().is_empty() {
+            return;
+        }
+        let Some(ix) = self.active else {
+            self.status = "No file open".into();
+            cx.notify();
+            return;
+        };
+        let query = self.find_query.clone();
+        let effect = self.tabs[ix]
+            .editor
+            .update(cx, |editor, cx| edit(editor, &query, window, cx));
+        if let Some(message) = effect.status() {
+            self.status = message;
+        }
+        cx.notify();
+    }
+
     fn palette_visible(&self) -> usize {
         let Some(palette) = &self.palette else {
             return 0;
@@ -298,6 +452,7 @@ impl Ide {
             "copy" => self.with_editor(window, cx, |editor, _, cx| editor.copy(cx)),
             "paste" => self.with_editor(window, cx, |editor, window, cx| editor.paste(window, cx)),
             "select-all" => self.with_editor(window, cx, |editor, _, cx| editor.select_all(cx)),
+            "find" => self.open_find(window, cx),
             _ => cx.notify(),
         }
     }
@@ -919,6 +1074,15 @@ impl Render for Ide {
         });
         let palette_left = ((window.bounds().size.width - px(420.)) / 2.).max(px(0.));
         let palette_focus = self.palette_focus.clone();
+        let find_focus = self.find_focus.clone();
+        let find_editing = self.find_focus.is_focused(window);
+        let find_view = self.find_open.then(|| FindBarView {
+            needle: SharedString::from(self.find_query.needle()),
+            replacement: SharedString::from(self.find_query.replacement()),
+            needle_active: find_editing && self.find_query.field() == find::FindField::Needle,
+            replacement_active: find_editing
+                && self.find_query.field() == find::FindField::Replacement,
+        });
         let active_editor = self
             .active
             .and_then(|ix| self.tabs.get(ix))
@@ -941,6 +1105,7 @@ impl Render for Ide {
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_close_menu))
             .on_action(cx.listener(Self::on_command_palette))
+            .on_action(cx.listener(Self::on_find))
             .child(ui::menu_bar(
                 cx.listener(|ide, _: &ClickEvent, _, cx| ide.toggle_menu(MenuId::File, cx)),
                 cx.listener(|ide, _: &ClickEvent, _, cx| ide.toggle_menu(MenuId::Edit, cx)),
@@ -959,6 +1124,8 @@ impl Render for Ide {
                         active_editor,
                         folder_name,
                         entity.clone(),
+                        find_view,
+                        find_focus,
                     )),
             )
             .child(ui::status_bar(status))
@@ -1033,9 +1200,12 @@ fn editor_column(
     editor: Option<Entity<CodeEditor>>,
     folder_name: String,
     entity: Entity<Ide>,
+    find: Option<FindBarView>,
+    find_focus: FocusHandle,
 ) -> impl IntoElement {
     let select_entity = entity.clone();
-    let close_entity = entity;
+    let close_entity = entity.clone();
+    let find_entity = entity;
     div()
         .flex_1()
         .h_full()
@@ -1054,13 +1224,28 @@ fn editor_column(
                 },
             ))
         })
+        .when_some(find, |column, find| {
+            column.child(div().w_full().track_focus(&find_focus).child(ui::find_bar(
+                find.needle,
+                find.replacement,
+                find.needle_active,
+                find.replacement_active,
+                move |action, window, cx| {
+                    find_entity.update(cx, |ide, cx| ide.on_find_action(action, window, cx));
+                },
+            )))
+        })
         .child(match editor {
             Some(editor) => div()
                 .flex_1()
                 .min_h(px(0.))
                 .child(editor)
                 .into_any_element(),
-            None => ui::empty_state(folder_name).into_any_element(),
+            None => div()
+                .flex_1()
+                .min_h(px(0.))
+                .child(ui::empty_state(folder_name))
+                .into_any_element(),
         })
 }
 
@@ -1309,8 +1494,21 @@ fn menu_entries(menu: MenuId) -> Vec<MenuEntry> {
                 label: "Select All",
                 shortcut: ui::primary_shortcut("A"),
             },
+            MenuEntry::Separator,
+            MenuEntry::Item {
+                id: "find",
+                label: "Find",
+                shortcut: ui::primary_shortcut("F"),
+            },
         ],
     }
+}
+
+struct FindBarView {
+    needle: SharedString,
+    replacement: SharedString,
+    needle_active: bool,
+    replacement_active: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

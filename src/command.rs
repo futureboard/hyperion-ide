@@ -1,7 +1,7 @@
 //! Commands the shell can already run, and the palette state that filters them.
 //!
 //! Ids are the strings dispatched today: `new-file`, `open-file`, `open-folder`,
-//! `save`, `close`, `quit`, `undo`, `redo`, `cut`, `copy`, `paste`, `select-all`.
+//! `save`, `close`, `quit`, `undo`, `redo`, `cut`, `copy`, `paste`, `select-all`, `find`.
 #![allow(dead_code)]
 
 use std::rc::Rc;
@@ -78,6 +78,7 @@ impl CommandRegistry {
             ("copy", "Copy", "C"),
             ("paste", "Paste", "V"),
             ("select-all", "Select All", "A"),
+            ("find", "Find", "F"),
         ];
         for (id, title, chord) in edit {
             registry.register(Command::new(
@@ -427,6 +428,7 @@ mod tests {
             ("copy", "Copy", "Edit", "C"),
             ("paste", "Paste", "Edit", "V"),
             ("select-all", "Select All", "Edit", "A"),
+            ("find", "Find", "Edit", "F"),
         ];
         assert_eq!(registry.list().len(), expected.len());
         for (command, (id, title, category, chord)) in registry.list().iter().zip(expected) {
@@ -459,7 +461,7 @@ mod tests {
             palette.move_down(all.len());
         }
         assert_eq!(palette.selected_index(), all.len() - 1);
-        assert_eq!(palette.selected_id(&all), Some("select-all"));
+        assert_eq!(palette.selected_id(&all), Some("find"));
 
         for _ in 0..30 {
             palette.move_up(all.len());

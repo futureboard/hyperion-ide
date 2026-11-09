@@ -1,7 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, ClickEvent, IntoElement, MouseDownEvent, SharedString, Window, div, prelude::*, px,
+    App, ClickEvent, CursorStyle, IntoElement, MouseDownEvent, SharedString, Window, div,
+    prelude::*, px,
 };
 
 use crate::theme;
@@ -27,6 +28,14 @@ pub struct StatusInfo {
     pub language: String,
     pub encoding: String,
     pub dirty: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindAction {
+    Needle,
+    Replacement,
+    ReplaceOne,
+    ReplaceAll,
 }
 
 pub enum MenuEntry {
@@ -159,17 +168,11 @@ pub fn tab_strip(
                         .cursor_pointer()
                 })
                 .on_click(move |_, window, cx| select(id, window, cx))
-                .child(
-                    div()
-                        .h(px(2.))
-                        .w_full()
-                        .flex_shrink_0()
-                        .bg(if active {
-                            theme::accent()
-                        } else {
-                            gpui::rgba(0x00000000)
-                        }),
-                )
+                .child(div().h(px(2.)).w_full().flex_shrink_0().bg(if active {
+                    theme::accent()
+                } else {
+                    gpui::rgba(0x00000000)
+                }))
                 .child(
                     div()
                         .flex_1()
@@ -245,6 +248,134 @@ pub fn empty_state(folder_name: impl Into<SharedString>) -> impl IntoElement {
                 .child(format!("{}  New File", primary_shortcut("N")))
                 .child(format!("{}  Save", primary_shortcut("S"))),
         )
+}
+
+pub fn find_bar(
+    needle: SharedString,
+    replacement: SharedString,
+    needle_active: bool,
+    replacement_active: bool,
+    on_action: impl Fn(FindAction, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let on_action = Rc::new(on_action);
+    let needle_action = on_action.clone();
+    let replacement_action = on_action.clone();
+    let replace_one = on_action.clone();
+    let replace_all = on_action;
+    div()
+        .id("find-bar")
+        .h(px(36.))
+        .w_full()
+        .px_3()
+        .flex()
+        .items_center()
+        .gap_2()
+        .bg(theme::chrome_bg())
+        .border_b_1()
+        .border_color(theme::border())
+        .text_size(px(13.))
+        .child(find_slot(
+            "find-needle",
+            "Find",
+            needle,
+            needle_active,
+            move |_, window, cx| needle_action(FindAction::Needle, window, cx),
+        ))
+        .child(find_slot(
+            "find-replacement",
+            "Replace",
+            replacement,
+            replacement_active,
+            move |_, window, cx| replacement_action(FindAction::Replacement, window, cx),
+        ))
+        .child(find_button(
+            "find-replace",
+            "Replace",
+            move |_, window, cx| replace_one(FindAction::ReplaceOne, window, cx),
+        ))
+        .child(find_button(
+            "find-replace-all",
+            "Replace All",
+            move |_, window, cx| replace_all(FindAction::ReplaceAll, window, cx),
+        ))
+}
+
+fn find_slot(
+    id: &'static str,
+    label: &'static str,
+    value: SharedString,
+    active: bool,
+    on_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_1()
+        .min_w(px(0.))
+        .h(px(24.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .on_mouse_down(gpui::MouseButton::Left, on_down)
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(theme::muted())
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .h(px(24.))
+                .px_2()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .bg(theme::editor_bg())
+                .border_1()
+                .border_color(if active {
+                    theme::accent()
+                } else {
+                    theme::border()
+                })
+                .cursor(CursorStyle::IBeam)
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_color(theme::text())
+                        .child(value),
+                )
+                .when(active, |field| {
+                    field.child(
+                        div()
+                            .w(px(1.))
+                            .h(px(14.))
+                            .flex_shrink_0()
+                            .bg(theme::accent()),
+                    )
+                }),
+        )
+}
+
+fn find_button(
+    id: &'static str,
+    label: &'static str,
+    on_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .h(px(24.))
+        .px_2()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .whitespace_nowrap()
+        .text_color(theme::text())
+        .hover(|style| style.bg(theme::hover()).cursor_pointer())
+        .on_mouse_down(gpui::MouseButton::Left, on_down)
+        .child(label)
 }
 
 pub fn status_bar(info: StatusInfo) -> impl IntoElement {

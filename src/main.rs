@@ -2,13 +2,14 @@ mod app;
 mod buffer;
 mod command;
 mod editor;
+mod find;
 mod highlight;
 mod persist;
 mod theme;
 mod ui;
 mod workspace;
 
-use app::{CloseMenu, CloseTab, CommandPalette, NewFile, OpenFile, OpenFolder, Quit, Save};
+use app::{CloseMenu, CloseTab, CommandPalette, Find, NewFile, OpenFile, OpenFolder, Quit, Save};
 use gpui::{
     App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
 };
@@ -55,6 +56,7 @@ fn bind_app_keys(cx: &mut App) {
         KeyBinding::new("secondary-w", CloseTab, None),
         KeyBinding::new("secondary-q", Quit, None),
         KeyBinding::new("secondary-shift-p", CommandPalette, None),
+        KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("escape", CloseMenu, None),
     ]);
 }
